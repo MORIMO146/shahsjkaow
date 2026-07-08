@@ -23,25 +23,70 @@ if 'market_data' not in st.session_state:
 
 @st.cache_resource
 def init_mexc(api_key, secret_key):
-    config = {
-        'enableRateLimit': True,
-        'options': {'defaultType': 'spot'},
-        'hostname': 'api.mexc.me'
-    }
-    if api_key and secret_key:
-        config['apiKey'] = api_key
-        config['secret'] = secret_key
-        
-    client = ccxt.mexc(config)
+    """Исправленная инициализация MEXC клиента"""
+    exchange_class = getattr(ccxt, 'mexc')
     
-    if 'spot' in client.urls.get('api', {}):
-        client.urls['api']['spot']['public'] = 'https://api.mexc.me'
-        client.urls['api']['spot']['private'] = 'https://api.mexc.me'
-    else:
-        client.urls['api']['public'] = 'https://api.mexc.me/api/v3'
-        client.urls['api']['private'] = 'https://api.mexc.me/api/v3'
+    # Правильная конфигурация без подмены URL
+    exchange = exchange_class({
+        'apiKey': api_key if api_key else '',
+        'secret': secret_key if secret_key else '',
+        'enableRateLimit': True,
+        'options': {
+            'defaultType': 'spot',
+        }
+    })
+    
+    return exchange
+
+def fetch_ohlcv_safe(exchange, symbol, timeframe='1h', limit=15):
+    """Безопасное получение свечных данных"""
+    try:
+        # Пробуем стандартный метод
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        return ohlcv, None
+    except Exception as e:
+        error_msg = str(e)
         
-    return client
+        # Если ошибка связана с endpoint, пробуем через публичное API напрямую
+        if 'capital/config' in error_msg or 'getall' in error_msg:
+            try:
+                # Альтернативный метод через публичный эндпоинт
+                timestamp = exchange.milliseconds()
+                
+                # Формируем правильный URL для свечей
+                base_url = 'https://api.mexc.com'
+                endpoint = '/api/v3/klines'
+                
+                params = {
+                    'symbol': symbol.replace('/', ''),
+                    'interval': timeframe,
+                    'limit': limit
+                }
+                
+                url = f"{base_url}{endpoint}"
+                response = requests.get(url, params=params)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    # Конвертируем в формат CCXT
+                    ohlcv = []
+                    for candle in data:
+                        ohlcv.append([
+                            int(candle[0]),           # timestamp
+                            float(candle[1]),         # open
+                            float(candle[2]),         # high
+                            float(candle[3]),         # low
+                            float(candle[4]),         # close
+                            float(candle[5])          # volume
+                        ])
+                    return ohlcv, None
+                else:
+                    return None, f"HTTP {response.status_code}: {response.text}"
+                    
+            except Exception as alt_e:
+                return None, f"Альтернативный метод тоже не сработал: {str(alt_e)}"
+        else:
+            return None, error_msg
 
 def analyze_with_ai(market_data, symbol, timeframe, current_price, ai_token, model_name):
     """Отправка данных на анализ в RouterAI"""
@@ -113,24 +158,9 @@ def analyze_with_ai(market_data, symbol, timeframe, current_price, ai_token, mod
     except requests.exceptions.Timeout:
         return None, "Таймаут запроса к RouterAI"
     except json.JSONDecodeError as e:
-        return None, f"Ошибка парсинга JSON: {str(e)}\nСырой ответ: {ai_reply if 'ai_reply' in locals() else 'Нет данных'}"
+        return None, f"Ошибка парсинга JSON: {str(e)}"
     except Exception as e:
         return None, f"Неизвестная ошибка: {str(e)}"
-
-def execute_trade_signal(signal, symbol, mexc_client):
-    """Эмуляция исполнения торгового сигнала"""
-    action = signal.get('action', 'HOLD')
-    if action == 'HOLD':
-        return "Сигнал HOLD - сделка не открывается"
-    
-    # Здесь можно добавить реальное исполнение через mexc_client.create_order()
-    trade_msg = f"📊 [{action}] {symbol} | Уверенность: {signal.get('confidence', 0)*100:.1f}%"
-    if 'stop_loss' in signal:
-        trade_msg += f" | SL: ${signal['stop_loss']:.2f}"
-    if 'take_profit' in signal:
-        trade_msg += f" | TP: ${signal['take_profit']:.2f}"
-    
-    return trade_msg
 
 # Инициализация клиента MEXC
 mexc_client = init_mexc(api_key, secret_key)
@@ -154,8 +184,20 @@ with tab1:
     
     if st.button("📊 Собрать данные рынка", use_container_width=True):
         with st.spinner("Загрузка данных с MEXC..."):
-            try:
-                ohlcv = mexc_client.fetch_ohlcv(symbol, timeframe, limit=15)
+            # Используем безопасный метод получения данных
+            ohlcv, error = fetch_ohlcv_safe(mexc_client, symbol, timeframe, limit=15)
+            
+            if error:
+                st.error(f"❌ Ошибка MEXC: {error}")
+                
+                # Показываем дополнительную информацию для дебага
+                with st.expander("🔍 Технические детали"):
+                    st.write("Проверьте:")
+                    st.write("- Правильность API ключей")
+                    st.write("- Доступность API MEXC в вашем регионе")
+                    st.write("- Не заблокирован ли IP адрес")
+            else:
+                # Создаем DataFrame
                 df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
                 df['Timestamp'] = pd.to_datetime(df['Timestamp'], unit='ms')
                 
@@ -167,17 +209,19 @@ with tab1:
                 st.session_state['last_symbol'] = symbol
                 st.session_state['last_timeframe'] = timeframe
                 
-                # Отображение
+                # Отображение метрик
                 col1, col2, col3 = st.columns(3)
                 col1.metric("Текущая цена", f"${current_price:,.4f}")
                 col2.metric("Макс. за период", f"${df['High'].max():,.4f}")
                 col3.metric("Мин. за период", f"${df['Low'].min():,.4f}")
                 
-                st.line_chart(data=df, x='Timestamp', y='Close')
+                # График
+                st.line_chart(data=df.set_index('Timestamp')['Close'])
                 st.success("✅ Данные успешно загружены!")
                 
-            except Exception as e:
-                st.error(f"❌ Ошибка MEXC: {e}")
+                # Показываем сырые данные
+                with st.expander("📋 Сырые данные"):
+                    st.dataframe(df)
 
 with tab2:
     st.write("### 🧠 Настройка ИИ-модели")
@@ -273,15 +317,10 @@ with tab3:
                                 'price': st.session_state['current_price']
                             }
                             st.session_state['signals_history'].append(signal_record)
-                            
-                            # Показываем исполнение
-                            trade_result = execute_trade_signal(ai_json, symbol, mexc_client)
-                            st.write(f"**Исполнение:** {trade_result}")
         
         with col2:
-            if st.button("🔄 Авто-трейдинг (каждые 60с)", use_container_width=True):
-                st.info("Режим авто-трейдинга активирован (демо)")
-                # Здесь можно добавить цикл с time.sleep(60)
+            if st.button("🔄 Авто-трейдинг", use_container_width=True):
+                st.info("🔄 Режим авто-трейдинга активирован (демо)")
     
     # История сигналов
     if st.session_state['signals_history']:
